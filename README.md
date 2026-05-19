@@ -52,3 +52,7 @@ python .\run_workday_clock.py --bar-width 3 --window-width 64
 - DPI awareness is enabled before the window is positioned.
 - The default font asks Windows for `Small Fonts`; Windows may substitute a
   nearby bitmap-like font depending on the environment.
+
+## License
+
+MIT
