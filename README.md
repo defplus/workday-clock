@@ -3,7 +3,7 @@
 A thin cyan right-edge workday timer for Windows.
 
 Workday Clock draws a transparent, click-through overlay on the right edge of
-the primary display. By default it maps 08:00 to the top of the primary monitor
+the secondary display. By default it maps 08:00 to the top of that monitor's
 work area and 20:00 to the bottom. The bright cyan segment is the remaining
 workday time, the current time is pinned to its current position, and each hour
 has a compact label.
@@ -39,16 +39,22 @@ The overlay also adds a task tray icon. Right-click it and choose
 ```powershell
 python .\run_workday_clock.py --interactive
 python .\run_workday_clock.py --start-hour 9 --end-hour 18
+python .\run_workday_clock.py --monitor 2
 python .\run_workday_clock.py --bar-width 3 --window-width 64
 ```
 
 `--interactive` disables click-through so the overlay window can be inspected.
+`--monitor` selects the Windows display number for the right-edge overlay. The
+default is the secondary display; if the requested display cannot be found, the
+clock falls back to another available monitor and finally to the primary display.
 
 ## Notes
 
 - Windows only.
-- The overlay uses the primary monitor work area, so it should avoid the
+- The overlay uses the target monitor work area, so it should avoid the
   taskbar.
+- The window periodically reapplies topmost placement so normal console windows
+  should not cover it.
 - DPI awareness is enabled before the window is positioned.
 - The default font asks Windows for `Small Fonts`; Windows may substitute a
   nearby bitmap-like font depending on the environment.

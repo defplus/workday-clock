@@ -2,22 +2,33 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import re
 import threading
 import tkinter as tk
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, cast
+from typing import Callable, Sequence, cast
 
 
 TRANSPARENT_COLOR = "#00ff00"
+DISPLAY_DEVICE_RE = re.compile(r"DISPLAY(\d+)$", re.IGNORECASE)
+HWND_TOPMOST = -1
+MONITORINFOF_PRIMARY = 0x00000001
+SPI_GETWORKAREA = 0x0030
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+SWP_NOOWNERZORDER = 0x0200
 
 
 @dataclass(frozen=True)
 class WorkdayClockConfig:
     start_hour: int = 8
     end_hour: int = 20
+    monitor: int | None = None
     window_width: int = 68
     bar_width: int = 4
     edge_padding: int = 2
@@ -26,6 +37,70 @@ class WorkdayClockConfig:
     click_through: bool = True
     window_opacity: float = 1.0
     tray_icon: Path | None = None
+
+
+@dataclass(frozen=True)
+class MonitorWorkArea:
+    left: int
+    top: int
+    right: int
+    bottom: int
+    number: int | None = None
+    device_name: str = ""
+    is_primary: bool = False
+
+    def as_tuple(self) -> tuple[int, int, int, int]:
+        return self.left, self.top, self.right, self.bottom
+
+
+def display_number_from_device_name(device_name: str) -> int | None:
+    match = DISPLAY_DEVICE_RE.search(device_name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def select_monitor_work_area(
+    monitors: Sequence[MonitorWorkArea],
+    target_monitor: int | None,
+) -> MonitorWorkArea | None:
+    if not monitors:
+        return None
+
+    if all(monitor.number is not None for monitor in monitors):
+        ordered = sorted(monitors, key=lambda monitor: monitor.number or 0)
+    else:
+        ordered = list(monitors)
+
+    if target_monitor is None:
+        primary = next((monitor for monitor in ordered if monitor.is_primary), None)
+        if primary is not None:
+            secondary = next((monitor for monitor in ordered if monitor is not primary), None)
+            if secondary is not None:
+                return secondary
+        if len(ordered) > 1:
+            return ordered[1]
+        return primary or ordered[0]
+
+    for monitor in monitors:
+        if monitor.number == target_monitor:
+            return monitor
+
+    if 1 <= target_monitor <= len(ordered):
+        return ordered[target_monitor - 1]
+
+    primary = next((monitor for monitor in monitors if monitor.is_primary), None)
+    return primary or monitors[0]
+
+
+def _tk_geometry_offset(value: int) -> str:
+    if value >= 0:
+        return f"+{value}"
+    return str(value)
+
+
+def format_window_geometry(width: int, height: int, x: int, y: int) -> str:
+    return f"{width}x{height}{_tk_geometry_offset(x)}{_tk_geometry_offset(y)}"
 
 
 def workday_progress(
@@ -90,6 +165,25 @@ class WNDCLASSW(ctypes.Structure):
         ("hbrBackground", wintypes.HBRUSH),
         ("lpszMenuName", wintypes.LPCWSTR),
         ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", ctypes.c_wchar * 32),
     ]
 
 
@@ -388,6 +482,7 @@ class WorkdayClockOverlay:
         self._position_window()
         self.root.update_idletasks()
         self._apply_win32_window_styles()
+        self._refresh_topmost()
         if hasattr(ctypes, "windll"):
             self.tray = TrayIcon(
                 icon_path=self.config.tray_icon,
@@ -398,7 +493,8 @@ class WorkdayClockOverlay:
 
     def run(self) -> None:
         self._schedule_tick()
-        self._schedule_position_refresh()
+        self.root.after_idle(self._position_window)
+        self.root.after(10_000, self._schedule_position_refresh)
         self.root.mainloop()
 
     def shutdown(self) -> None:
@@ -430,6 +526,7 @@ class WorkdayClockOverlay:
         bottom = max(top + 1, self.canvas_height - self.config.bottom_padding)
         span = bottom - top
         current_y = top + int(round(span * progress))
+        current_label_y = max(top + 5, min(bottom - 5, current_y))
 
         self.canvas.create_line(bar_x1 - 1, top, bar_x1 - 1, bottom, fill="#06363b", width=1)
         self.canvas.create_rectangle(bar_x1, top, bar_x2, bottom, fill="#06272c", outline="")
@@ -448,16 +545,16 @@ class WorkdayClockOverlay:
             major_color = "#9efaff" if hour in {self.config.start_hour, self.config.end_hour} else "#45dce6"
             tick_len = 8 if hour in {self.config.start_hour, self.config.end_hour} else 5
             self.canvas.create_line(bar_x1 - tick_len, y, bar_x1 - 1, y, fill=major_color, width=1)
-            self._pixel_text(
-                bar_x1 - tick_len - 2,
-                y,
-                f"{hour:02d}",
-                fill=major_color,
-                font=self.hour_font,
-                anchor="e",
-            )
+            if abs(y - current_label_y) >= 14:
+                self._pixel_text(
+                    bar_x1 - tick_len - 2,
+                    y,
+                    f"{hour:02d}",
+                    fill=major_color,
+                    font=self.hour_font,
+                    anchor="e",
+                )
 
-        current_label_y = max(top + 5, min(bottom - 5, current_y))
         self._pixel_text(
             bar_x1 - 13,
             current_label_y,
@@ -482,37 +579,186 @@ class WorkdayClockOverlay:
         self.canvas.create_text(x, y, text=text, anchor=anchor, fill=fill, font=font)
 
     def _position_window(self) -> None:
-        _left, top, right, bottom = self._primary_work_area()
+        _left, top, right, bottom = self._target_work_area()
+        width = self.config.window_width
         height = max(1, bottom - top)
         if height != self.canvas_height:
             self.canvas_height = height
             self.canvas.configure(height=height)
-        x = right - self.config.window_width
-        self.root.geometry(f"{self.config.window_width}x{height}+{x}+{top}")
+        x = right - width
+        self.root.geometry(f"{width}x{height}")
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            return
+        if not self._set_window_bounds(width, height, x, top):
+            self.root.geometry(format_window_geometry(width, height, x, top))
+            self._refresh_topmost()
+
+    def _target_work_area(self) -> tuple[int, int, int, int]:
+        monitor = select_monitor_work_area(self._monitor_work_areas(), self.config.monitor)
+        if monitor is not None:
+            return monitor.as_tuple()
+        return self._primary_work_area()
+
+    def _monitor_work_areas(self) -> list[MonitorWorkArea]:
+        if not hasattr(ctypes, "windll"):
+            return []
+
+        monitors: list[MonitorWorkArea] = []
+        user32 = ctypes.windll.user32
+
+        try:
+            callback_type = ctypes.WINFUNCTYPE(
+                wintypes.BOOL,
+                wintypes.HANDLE,
+                wintypes.HDC,
+                ctypes.POINTER(RECT),
+                wintypes.LPARAM,
+            )
+
+            user32.GetMonitorInfoW.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(MONITORINFOEXW),
+            ]
+            user32.GetMonitorInfoW.restype = wintypes.BOOL
+            user32.EnumDisplayMonitors.argtypes = [
+                wintypes.HDC,
+                ctypes.c_void_p,
+                callback_type,
+                wintypes.LPARAM,
+            ]
+            user32.EnumDisplayMonitors.restype = wintypes.BOOL
+
+            def collect_monitor(
+                hmonitor: int,
+                _hdc: int,
+                _rect: ctypes.POINTER(RECT),
+                _data: int,
+            ) -> bool:
+                info = MONITORINFOEXW()
+                info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+                if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+                    work = info.rcWork
+                    if work.right > work.left and work.bottom > work.top:
+                        device_name = str(info.szDevice).rstrip("\x00")
+                        monitors.append(
+                            MonitorWorkArea(
+                                left=int(work.left),
+                                top=int(work.top),
+                                right=int(work.right),
+                                bottom=int(work.bottom),
+                                number=display_number_from_device_name(device_name),
+                                device_name=device_name,
+                                is_primary=bool(info.dwFlags & MONITORINFOF_PRIMARY),
+                            )
+                        )
+                return True
+
+            callback = callback_type(collect_monitor)
+            user32.EnumDisplayMonitors(None, None, callback, 0)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return []
+
+        return monitors
 
     def _primary_work_area(self) -> tuple[int, int, int, int]:
         if hasattr(ctypes, "windll"):
             try:
-                class RECT(ctypes.Structure):
-                    _fields_ = [
-                        ("left", ctypes.c_long),
-                        ("top", ctypes.c_long),
-                        ("right", ctypes.c_long),
-                        ("bottom", ctypes.c_long),
-                    ]
-
                 rect = RECT()
-                ok = ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)
+                ok = ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
                 if ok and rect.right > rect.left and rect.bottom > rect.top:
                     return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
             except (AttributeError, OSError):
                 pass
         return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
 
+    def _refresh_topmost(self) -> None:
+        try:
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+        except tk.TclError:
+            return
+
+        if not hasattr(ctypes, "windll"):
+            return
+
+        try:
+            hwnd = self._window_handle()
+            set_window_pos = ctypes.windll.user32.SetWindowPos
+            set_window_pos.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            ]
+            set_window_pos.restype = wintypes.BOOL
+            set_window_pos(
+                hwnd,
+                ctypes.c_void_p(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER,
+            )
+        except (AttributeError, OSError, TypeError, ValueError):
+            return
+
+    def _set_window_bounds(self, width: int, height: int, x: int, y: int) -> bool:
+        if not hasattr(ctypes, "windll"):
+            return False
+
+        try:
+            self.root.attributes("-topmost", True)
+            hwnd = self._window_handle()
+            set_window_pos = ctypes.windll.user32.SetWindowPos
+            set_window_pos.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            ]
+            set_window_pos.restype = wintypes.BOOL
+            ok = set_window_pos(
+                hwnd,
+                ctypes.c_void_p(HWND_TOPMOST),
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER,
+            )
+            return bool(ok)
+        except (AttributeError, OSError, tk.TclError, TypeError, ValueError):
+            return False
+
+    def _window_handle(self) -> ctypes.c_void_p:
+        hwnd = ctypes.c_void_p(self.root.winfo_id())
+        if not hasattr(ctypes, "windll"):
+            return hwnd
+
+        try:
+            get_parent = ctypes.windll.user32.GetParent
+            get_parent.argtypes = [ctypes.c_void_p]
+            get_parent.restype = ctypes.c_void_p
+            parent = get_parent(hwnd)
+            if parent:
+                return ctypes.c_void_p(parent)
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+        return hwnd
+
     def _apply_win32_window_styles(self) -> None:
         if not hasattr(ctypes, "windll"):
             return
-        hwnd = ctypes.c_void_p(self.root.winfo_id())
+        hwnd = self._window_handle()
         user32 = ctypes.windll.user32
 
         get_window_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
@@ -565,13 +811,22 @@ def main() -> int:
     )
     parser.add_argument("--start-hour", type=int, default=8, help="Workday start hour, 24-hour clock.")
     parser.add_argument("--end-hour", type=int, default=20, help="Workday end hour, 24-hour clock.")
+    parser.add_argument(
+        "--monitor",
+        type=int,
+        default=None,
+        help="Windows display number to attach to. Defaults to the secondary display.",
+    )
     parser.add_argument("--bar-width", type=int, default=4, help="Cyan strip width in pixels.")
     parser.add_argument("--window-width", type=int, default=68, help="Transparent overlay width in pixels.")
     args = parser.parse_args()
+    if args.monitor is not None and args.monitor < 1:
+        parser.error("--monitor must be 1 or greater.")
 
     config = WorkdayClockConfig(
         start_hour=args.start_hour,
         end_hour=args.end_hour,
+        monitor=args.monitor,
         bar_width=max(1, args.bar_width),
         window_width=max(32, args.window_width),
         click_through=not args.interactive,
